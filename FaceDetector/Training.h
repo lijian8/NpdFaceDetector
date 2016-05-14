@@ -68,10 +68,15 @@ int pair_to_linear(std::pair<int, int> pair) {
 // Convert a linear index to a pair of indices. Slow.
 std::pair<int, int> linear_to_pair(int linear) {
 	assert(linear >= 0);
-	int m = static_cast<int>(std::floor(0.5 * (1.0 + std::sqrt(8.0 * static_cast<double>(linear) + 1))));
+	int m = static_cast<int>(std::floor(0.5f * (1.0f + std::sqrt(8.0f * static_cast<float>(linear) + 1.0f))));
 	int n = linear - (m * (m - 1)) / 2;
 	assert(n >= 0 && n < m);
 	return std::make_pair(n, m);
+}
+
+void linear_to_pair(int * n, int * m, int linear) restrict(amp) {
+	*m = static_cast<int>(fm::floor(0.5f * (1.0f + fm::sqrt(8.0f * static_cast<float>(linear) + 1.0f))));
+	*n = linear - (*m * (*m - 1)) / 2;
 }
 
 int get_feature_dim(int pixel_count) {
@@ -93,7 +98,7 @@ unsigned int get_npd(unsigned int n, unsigned int m) restrict(amp, cpu) {
 		diff = static_cast<float>(n) / (static_cast<float>(n + m) + 0.5f);
 	}
 	// This is correct. If you do round(255 * diff), the bins at
-	//	// 0 and 255 will only be 0.5 wide.
+	// 0 and 255 will only be 0.5 wide.
 	diff = fm::fmin(fm::floor(256.0f * diff), 255.0f);
 	return static_cast<unsigned int>(diff);
 }
@@ -108,6 +113,7 @@ auto compute_npd_table() {
 	return npd_table;
 }
 
+// Using a table is three times faster on cpu.
 static const auto g_npd_table = compute_npd_table();
 
 unsigned char get_feature_value(std::vector<unsigned char> const & pixels, std::pair<int, int> pixel_indices) {
@@ -181,7 +187,7 @@ private:
 };
 
 
-void sort_by_increasing_weight(SampleRange * sample_range) {
+void sort_lowest_weight_first(SampleRange * sample_range) {
 	std::sort(sample_range->begin(), sample_range->end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_weight() < rhs.get_weight());
@@ -200,7 +206,7 @@ auto accumulate_histograms_cpu(SampleRange * sample_range) {
 	}
 
 	// So that add floats of approx. equal size.
-	sort_by_increasing_weight(sample_range);
+	sort_lowest_weight_first(sample_range);
 
 	for (auto sample = sample_range->begin(); sample < sample_range->end(); ++sample) {
 		auto const weight = static_cast<float>(sample->get_weight());
@@ -230,15 +236,13 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 	double scale = std::numeric_limits<unsigned int>::max() / weight_sum;
 	std::cout << "scale = " << scale << "\n";
 
-	unsigned int weight_sum_i = 0; // For debug
-	// Add dummy samples to get a multiple of 4
+	// Add dummy samples to get a multiple of 4.
 	int const extended_sample_count = 4 * ((sample_count + 3) / 4);
 	std::vector<unsigned char> pixel_stage(extended_sample_count * pixel_count);
 	std::vector<unsigned int> weight_stage(extended_sample_count);
 	auto samples = sample_range->begin();
 	for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
 		weight_stage[sample_index] = static_cast<unsigned int>(scale * samples[sample_index].get_weight());
-		weight_sum_i += weight_stage[sample_index]; // For debug
 		for (int pixel_index = 0; pixel_index < pixel_count; ++pixel_index) {
 			pixel_stage[pixel_index * extended_sample_count + sample_index] = samples[sample_index].get_pixels()[pixel_index];
 		}
@@ -256,28 +260,38 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 	concurrency::array_view<unsigned int, 2> histograms_view(feature_dim, 256, histograms.data());
 	histograms_view.discard_data();
 
-	int const feature_block_size = 45000;  // Can't be larger than 2 ^ 16
-	concurrency::extent<2> extent(256, feature_block_size);
-	concurrency::parallel_for_each(extent.tile<256, 1>(),
-		[=](concurrency::tiled_index<256, 1> index) restrict(amp) {
-		for (int feature_block_index = 0; feature_block_index < 2; ++feature_block_index) {
+	static int const MAX_FEATURES_PER_KERNEL = 65535;
+	static int const TILE_SIZE = 256;
+
+	int const feature_block_count = (feature_dim + MAX_FEATURES_PER_KERNEL - 1) / MAX_FEATURES_PER_KERNEL;
+	int const feature_block_size = (feature_dim + feature_block_count - 1) / feature_block_count;
+
+	for (int feature_block_index = 0; feature_block_index < feature_block_count; ++feature_block_index) {
+
+		int const feature_start_index = feature_block_index * feature_block_size;
+		int const remaining_features_count = feature_dim - feature_start_index;
+		int const actual_feature_block_size = std::min(feature_block_size, remaining_features_count);
+
+		concurrency::extent<2> extent(TILE_SIZE, actual_feature_block_size);
+		concurrency::parallel_for_each(extent.tile<TILE_SIZE, 1>(),
+			[=](concurrency::tiled_index<TILE_SIZE, 1> index) restrict(amp) {
 			tile_static unsigned int tile_histogram[256];
 
-			index.barrier.wait_with_tile_static_memory_fence();
 			tile_histogram[index.global[0]] = 0;
 			index.barrier.wait_with_tile_static_memory_fence();
 
-			int feature_index = index.global[1] + feature_block_index * feature_block_size;
+			int feature_index = feature_start_index + index.global[1];
 			if (feature_index < feature_dim) {
-				int m = static_cast<int>(pm::floor(0.5f * (1.0f + pm::sqrt(8.0f * static_cast<float>(feature_index) + 1.0f))));
-				int n = feature_index - (m * (m - 1)) / 2;
+				int n, m;
+				linear_to_pair(&n, &m, feature_index);
 
 				int begin_index = 0;
 				while (begin_index < pixel_block_count) {
 					int pixel_block_index = begin_index + index.global[0];
+					unsigned int pixels_n = pixel_view[n][pixel_block_index];
+					unsigned int pixels_m = pixel_view[m][pixel_block_index];
+
 					if (pixel_block_index < pixel_block_count) {
-						unsigned int pixels_n = pixel_view[n][pixel_block_index];
-						unsigned int pixels_m = pixel_view[m][pixel_block_index];
 						for (int pixel_index = 0; pixel_index < 4; ++pixel_index) {
 							unsigned int pixel_n = 0xff & pixels_n;
 							unsigned int pixel_m = 0xff & pixels_m;
@@ -291,7 +305,7 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 							pixels_m >>= 8;
 						}
 					}
-					begin_index += 256;
+					begin_index += TILE_SIZE;
 				}
 			}
 
@@ -299,8 +313,8 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 			if (feature_index < feature_dim) {
 				histograms_view[feature_index][index.global[0]] = tile_histogram[index.global[0]];
 			}
-		}
-	});
+		});
+	}
 	histograms_view.synchronize();
 
 	std::vector<std::array<float, 256>> histograms_out(feature_dim);
@@ -310,9 +324,6 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 			histograms_out[i][j] = static_cast<float>(histograms[i * 256 + j]) / static_cast<float>(scale);
 			sum += histograms[i * 256 + j];
 		}
-		/*if (sum != weight_sum_i) {
-			std::cout << i << ": " << sum << " != " << weight_sum_i << "\n";
-		}*/
 	}
 
 	return histograms_out;
@@ -321,24 +332,11 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 // Indexing is [label][feature_index][bin]
 typedef std::array<std::vector<std::array<float, 256>>, N_LABELS> histograms_type;
 
-auto place_positives_first_and_get_midpoint(SampleRange * sample_range) {
+auto sort_positives_first_and_get_midpoint(SampleRange * sample_range) {
 	return std::partition(sample_range->begin(), sample_range->end(),
 		[](Sample const & sample) {
 		return (sample.get_label() == POSITIVE);
 	});
-}
-
-histograms_type accumulate_histograms_per_label(SampleRange * sample_range) {
-	auto const range_midpoint = place_positives_first_and_get_midpoint(sample_range);
-	histograms_type histograms;
-	auto positive_range = SampleRange(sample_range->begin(), range_midpoint);
-	auto negative_range = SampleRange(range_midpoint, sample_range->end());
-	if (positive_range.empty() || negative_range.empty()) {
-		return histograms;
-	}
-	histograms[POSITIVE] = accumulate_histograms_cpu(&positive_range);
-	histograms[NEGATIVE] = accumulate_histograms_cpu(&negative_range);
-	return histograms;
 }
 
 // Compute the total weight per label.
@@ -365,7 +363,8 @@ std::array<double, N_LABELS> compute_weight_totals(histograms_type const & histo
 //     sum(w_k * y_k, k in R) ^ 2 / sum(w_k, k in R)
 //
 Split compute_best_split(histograms_type const & histograms) {
-	assert(!histograms.empty());
+	assert(!histograms[NEGATIVE].empty() &&
+		histograms[NEGATIVE].size() == histograms[POSITIVE].size());
 
 	enum {
 		LEFT = 0,
@@ -374,11 +373,6 @@ Split compute_best_split(histograms_type const & histograms) {
 	};
 
 	auto const feature_dim = histograms[NEGATIVE].size();
-	if (feature_dim == 0) {
-		std::cout << "Warning: Node is pure, can not split.\n";
-		return Split::Dummy();
-	}
-
 	auto const weight_totals = compute_weight_totals(histograms);
 
 	int best_feature_index = -1;
@@ -423,13 +417,21 @@ Split compute_best_split(histograms_type const & histograms) {
 	return Split(linear_to_pair(best_feature_index), best_threshold);
 }
 
-Split fit_stump(SampleRange * range) {
-	auto const histograms = accumulate_histograms_per_label(range);
+Split fit_stump(SampleRange * sample_range) {
+	auto const range_midpoint = sort_positives_first_and_get_midpoint(sample_range);
+	auto positive_range = SampleRange(sample_range->begin(), range_midpoint);
+	auto negative_range = SampleRange(range_midpoint, sample_range->end());
+	if (positive_range.empty() || negative_range.empty()) {
+		std::cout << "Warning: Node is pure, can not split.\n";
+		return Split::Dummy();
+	}
+	histograms_type histograms;
+	histograms[POSITIVE] = accumulate_histograms_cpu(&positive_range);
+	histograms[NEGATIVE] = accumulate_histograms_cpu(&negative_range);
 	return compute_best_split(histograms);
 }
 
-// Moves all samples that goes left in the split to the beginning of the range.
-SampleRange::iterator partition_samples(SampleRange * range, Split const& split) {
+SampleRange::iterator sort_goes_left_first_and_get_midpoint(SampleRange * range, Split const& split) {
 	return std::partition(range->begin(), range->end(),
 		[split](Sample & sample) { return split.goes_left(sample.get_pixels()); });
 }
@@ -513,7 +515,7 @@ DenseTree fit_tree(SampleRange * range, int depth, int min_leaf_occupancy) {
 		range_stack.pop_front();
 		Split split = fit_stump(&range);
 		tree.push_back_split(split);
-		auto range_midpoint = partition_samples(&range, split);
+		auto range_midpoint = sort_goes_left_first_and_get_midpoint(&range, split);
 		range_stack.push_back(SampleRange(range.begin(), range_midpoint));
 		range_stack.push_back(SampleRange(range_midpoint, range.end()));
 	}

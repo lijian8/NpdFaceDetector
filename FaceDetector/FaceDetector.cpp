@@ -42,11 +42,11 @@ TEST(training, split) {
 	EXPECT_FALSE(goes_left(19, 18));
 }
 
-TEST(training, sort_by_increasing_weight) {
+TEST(training, sort_lowest_weight_first) {
 	std::vector<Sample> samples = {
 		Sample(NEGATIVE, { }, 2),
 		Sample(NEGATIVE, { }, 1) };
-	sort_by_increasing_weight(&SampleRange(samples));
+	sort_lowest_weight_first(&SampleRange(samples));
 	EXPECT_LT(samples[0].get_weight(), samples[1].get_weight());
 }
 
@@ -60,19 +60,6 @@ TEST(training, accumulate_histograms) {
 
 	EXPECT_DOUBLE_EQ(1, histograms[pair_to_linear({ 1, 2 })][g_npd_table[2][0]]);
 	EXPECT_DOUBLE_EQ(1 + 3, histograms[pair_to_linear({ 0, 1 })][g_npd_table[2][2]]);
-}
-
-TEST(training, accumulate_histograms_per_label) {
-	std::vector<Sample> samples = {
-		Sample(NEGATIVE,{ 0, 0 }, 1),
-		Sample(POSITIVE,{ 0, 0 }, 3),
-		Sample(POSITIVE,{ 0, 0 }, 5) };
-
-	auto histograms = accumulate_histograms_per_label(&SampleRange(samples));
-	auto weight_totals = compute_weight_totals(histograms);
-
-	EXPECT_DOUBLE_EQ(1, weight_totals[NEGATIVE]);
-	EXPECT_DOUBLE_EQ(3 + 5, weight_totals[POSITIVE]);
 }
 
 auto get_empty_histograms() {
@@ -179,7 +166,7 @@ class DummySampleGenerator {
 public:
 	DummySampleGenerator(int sample_count, int pixel_count) {
 		_samples.reserve(sample_count);
-		srand(41);
+		srand(42);
 		for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
 			std::vector<unsigned char> pixels(pixel_count);
 			std::generate(pixels.begin(), pixels.end(), []() { return rand() % 256; });
@@ -194,32 +181,27 @@ private:
 	std::vector<Sample> _samples;
 };
 
-TEST(training, normalized_pixel_difference) {
-	auto npd_table = compute_npd_table();
+TEST(training, normalized_pixel_difference_gpu) {
+	auto npd_table_cpu = compute_npd_table();
 
-	std::array<unsigned int, 256 * 256> npd_gpu;
-	concurrency::array_view<unsigned int, 2> npd_gpu_view(256, 256, npd_gpu.data());
+	std::array<unsigned int, 256 * 256> npd_table_gpu;
+	concurrency::array_view<unsigned int, 2> npd_table_gpu_view(256, 256, npd_table_gpu.data());
 	concurrency::parallel_for_each(
-		npd_gpu_view.extent,
+		npd_table_gpu_view.extent,
 		[=](concurrency::index<2> index) restrict(amp) {
-		npd_gpu_view[index] = get_npd(index[0], index[1]);
+		npd_table_gpu_view[index] = get_npd(index[0], index[1]);
 	});
-	npd_gpu_view.synchronize();
+	npd_table_gpu_view.synchronize();
 	for (int i = 0; i < 256; ++i) {
 		for (int j = 0; j < 256; ++j) {
-			EXPECT_EQ(npd_table[i][j], npd_gpu[i * 256 + j]) <<
+			EXPECT_EQ(npd_table_cpu[i][j], npd_table_gpu[i * 256 + j]) <<
 				"i = " << i << " j = " << j;
 		}
 	}
 }
 
-//TEST(training, fit_tree_benchmark) {
-//	auto const tree = fit_tree(&SampleRange(data.get_samples()), 5, 0);
-//	EXPECT_EQ(5, tree.get_depth());
-//}
-
 TEST(training, accumulate_histograms_comparison) {
-	DummySampleGenerator data(1001, 400);
+	DummySampleGenerator data(501, 400);
 
 	auto res_gpu = accumulate_histograms_gpu(&SampleRange(data.get_samples()));
 	auto res_cpu = accumulate_histograms_cpu(&SampleRange(data.get_samples()));
@@ -232,12 +214,12 @@ TEST(training, accumulate_histograms_comparison) {
 	}
 }
 
-DummySampleGenerator g_data(20001, 400);
+DummySampleGenerator g_data(501, 401);
 
-TEST(training, accumulate_histograms_cpu) {
-	auto res = accumulate_histograms_cpu(&SampleRange(g_data.get_samples()));
-	ASSERT_FALSE(res.empty());
-}
+//TEST(training, accumulate_histograms_cpu) {
+//	auto res = accumulate_histograms_cpu(&SampleRange(g_data.get_samples()));
+//	ASSERT_FALSE(res.empty());
+//}
 
 TEST(training, accumulate_histograms_gpu) {
 	auto res = accumulate_histograms_gpu(&SampleRange(g_data.get_samples()));
