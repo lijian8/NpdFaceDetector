@@ -14,7 +14,6 @@
 #include <amp_math.h>
 
 namespace fm = concurrency::fast_math;
-namespace pm = concurrency::precise_math;
 
 enum LabelsEnum {
 	NEGATIVE = 0,
@@ -25,7 +24,7 @@ enum LabelsEnum {
 class Sample {
 public:
 	Sample(int label, std::vector<unsigned char> const && pixels) :
-		_label(label), _weight(1.0), _pixels(pixels) {
+		_label(label), _prediction(0.0), _weight(1.0), _pixels(pixels) {
 		assert(label == NEGATIVE || label == POSITIVE);
 	}
 
@@ -35,25 +34,22 @@ public:
 	}
 
 	int get_label() const { return _label; }
-	auto const& get_pixels() const { return _pixels; }
+	int get_signed_label() const { return 2 * _label - 1; }
 
-	void set_weight(double weight) { _weight = weight; }
+	double get_prediction() const { return _prediction; }
+	void set_prediction(double prediction) { _prediction = prediction; }
+
 	double get_weight() const { return _weight; }
+	void set_weight(double weight) { _weight = weight; }
+
+	auto const& get_pixels() const { return _pixels; }
 
 private:
 	int _label;
+	double _prediction;
 	double _weight;
 	std::vector<unsigned char> _pixels;
-
-	friend void swap(Sample &, Sample &);
 };
-
-// Needed by std::partition during learning.
-void swap(Sample & first, Sample & second) {
-	std::swap(first._label, second._label);
-	std::swap(first._weight, second._weight);
-	std::swap(first._pixels, second._pixels);
-}
 
 // Convert a pair of indices to a linear indices. 'first' must be less than 'second'.
 int pair_to_linear(std::pair<int, int> pair) {
@@ -164,7 +160,12 @@ class SampleRange {
 public:
 	typedef Sample * iterator;
 	typedef Sample const * const_iterator;
+	typedef Sample & reference;
+	typedef Sample const & const_reference;
 
+	SampleRange() :
+		_begin(nullptr), _end(nullptr) {
+	}
 	SampleRange(Sample * begin, Sample * end) :
 		_begin(begin), _end(end) {
 	}
@@ -175,10 +176,19 @@ public:
 	int size() const { return std::distance(begin(), end()); }
 	bool empty() const { return (size() == 0); }
 
-	iterator begin() { return _begin; }
-	iterator end() { return _end; }
+	reference operator[] (int idx) {
+		assert(0 <= idx && idx < size());
+		return _begin[idx];
+	}
+	const_reference operator[] (int idx) const {
+		assert(0 <= idx && idx < size());
+		return _begin[idx];
+	}
 
+	iterator begin() { return _begin; }
 	const_iterator begin() const { return _begin; }
+
+	iterator end() { return _end; }
 	const_iterator end() const { return _end; }
 
 private:
@@ -186,11 +196,17 @@ private:
 	Sample * _end;
 };
 
-
 void sort_lowest_weight_first(SampleRange * sample_range) {
 	std::sort(sample_range->begin(), sample_range->end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_weight() < rhs.get_weight());
+	});
+}
+
+void sort_highest_weight_first(SampleRange * sample_range) {
+	std::sort(sample_range->begin(), sample_range->end(),
+		[](Sample const & lhs, Sample const & rhs) {
+		return (lhs.get_weight() > rhs.get_weight());
 	});
 }
 
@@ -225,104 +241,108 @@ auto accumulate_histograms_cpu(SampleRange * sample_range) {
 }
 
 auto accumulate_histograms_gpu(SampleRange * sample_range) {
-
 	assert(!sample_range->empty());
 	int const sample_count = sample_range->size();
 	int const pixel_count = sample_range->begin()->get_pixels().size();
 	int const feature_dim = get_feature_dim(pixel_count);
 
+	// The gpu can only accumulate uints, so we need to convert the weights.
+	// We pick a scaling so that we approximatly hit uint max if all samples fall in the same bin.
 	double weight_sum = 0.0;
-	std::for_each(sample_range->begin(), sample_range->end(), [&](Sample const & sample) { weight_sum += sample.get_weight(); });
-	double scale = std::numeric_limits<unsigned int>::max() / weight_sum;
-	std::cout << "scale = " << scale << "\n";
+	for (auto const & sample : *sample_range) { weight_sum += sample.get_weight(); }
+	double const scale = 0.99 * (std::numeric_limits<unsigned int>::max() / weight_sum);
 
-	// Add dummy samples to get a multiple of 4.
+	// The gpu does not support chars, so we pack four pixels into a
+	// uint. We add up to three dummy samples, to get an even multiple of four.
 	int const extended_sample_count = 4 * ((sample_count + 3) / 4);
 	std::vector<unsigned char> pixel_stage(extended_sample_count * pixel_count);
 	std::vector<unsigned int> weight_stage(extended_sample_count);
 	auto samples = sample_range->begin();
 	for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
-		weight_stage[sample_index] = static_cast<unsigned int>(scale * samples[sample_index].get_weight());
+		weight_stage[sample_index] = static_cast<unsigned int>(std::round(scale * samples[sample_index].get_weight()));
 		for (int pixel_index = 0; pixel_index < pixel_count; ++pixel_index) {
 			pixel_stage[pixel_index * extended_sample_count + sample_index] = samples[sample_index].get_pixels()[pixel_index];
 		}
 	}
-	// Set dummy sample weights to 0.
+	// Set dummy samples' weights to 0.
 	for (int sample_index = sample_count; sample_index < extended_sample_count; ++sample_index) {
 		weight_stage[sample_index] = 0;
 	}
 
-	std::vector<unsigned int> histograms(256 * feature_dim);
+	// Use a raw array instead of a vector, to avoid zero initialization.
+	auto histograms = std::unique_ptr<unsigned int[]>(new unsigned int[256 * feature_dim]);
 
+	// Setup the array views.
 	int const pixel_block_count = extended_sample_count / 4;
 	concurrency::array_view<const unsigned int, 2> pixel_view(pixel_count, pixel_block_count, reinterpret_cast<unsigned int *>(pixel_stage.data()));
 	concurrency::array_view<const unsigned int, 1> weight_view(weight_stage);
-	concurrency::array_view<unsigned int, 2> histograms_view(feature_dim, 256, histograms.data());
+	concurrency::array_view<unsigned int, 2> histograms_view(feature_dim, 256, histograms.get());
 	histograms_view.discard_data();
 
-	static int const MAX_FEATURES_PER_KERNEL = 65535;
-	static int const TILE_SIZE = 256;
-
+	// We can't spawn enough threads to handle all features in one kernel,
+	// so we split the features up into "feature_blocks".
+	int const MAX_FEATURES_PER_KERNEL = 65535;
 	int const feature_block_count = (feature_dim + MAX_FEATURES_PER_KERNEL - 1) / MAX_FEATURES_PER_KERNEL;
 	int const feature_block_size = (feature_dim + feature_block_count - 1) / feature_block_count;
 
 	for (int feature_block_index = 0; feature_block_index < feature_block_count; ++feature_block_index) {
 
-		int const feature_start_index = feature_block_index * feature_block_size;
+		int const feature_start_index = feature_block_size * feature_block_index;
 		int const remaining_features_count = feature_dim - feature_start_index;
 		int const actual_feature_block_size = std::min(feature_block_size, remaining_features_count);
 
+		static int const TILE_SIZE = 256;
 		concurrency::extent<2> extent(TILE_SIZE, actual_feature_block_size);
 		concurrency::parallel_for_each(extent.tile<TILE_SIZE, 1>(),
 			[=](concurrency::tiled_index<TILE_SIZE, 1> index) restrict(amp) {
-			tile_static unsigned int tile_histogram[256];
 
+			// Each tile fills one histogram.
+			tile_static unsigned int tile_histogram[256];
 			tile_histogram[index.global[0]] = 0;
 			index.barrier.wait_with_tile_static_memory_fence();
 
-			int feature_index = feature_start_index + index.global[1];
-			if (feature_index < feature_dim) {
-				int n, m;
-				linear_to_pair(&n, &m, feature_index);
+			int const feature_index = feature_start_index + index.global[1];
+			int n, m;
+			linear_to_pair(&n, &m, feature_index);
 
-				int begin_index = 0;
-				while (begin_index < pixel_block_count) {
-					int pixel_block_index = begin_index + index.global[0];
-					unsigned int pixels_n = pixel_view[n][pixel_block_index];
-					unsigned int pixels_m = pixel_view[m][pixel_block_index];
+			// Process 'TILE_SIZE' pixel blocks in parallel.
+			for (int pixel_block_start = 0; pixel_block_start < pixel_block_count; pixel_block_start += TILE_SIZE) {
+				int const pixel_block_index = pixel_block_start + index.global[0];
 
-					if (pixel_block_index < pixel_block_count) {
-						for (int pixel_index = 0; pixel_index < 4; ++pixel_index) {
-							unsigned int pixel_n = 0xff & pixels_n;
-							unsigned int pixel_m = 0xff & pixels_m;
+				// The 'pixel_block_count' is not necessarily a multiple of 'TILE_SIZE'.
+				if (pixel_block_index < pixel_block_count) {
+					unsigned int const pixel_block_n = pixel_view[n][pixel_block_index];
+					unsigned int const pixel_block_m = pixel_view[m][pixel_block_index];
 
-							int bin = get_npd(pixel_n, pixel_m);
+					// There are four pixels in each pixel block.
+					for (int pixel_index = 0; pixel_index < 4; ++pixel_index) {
+						unsigned int const pixel_n = (pixel_block_n >> 8 * pixel_index) & 0xff;
+						unsigned int const pixel_m = (pixel_block_m >> 8 * pixel_index) & 0xff;
 
-							int sample_index = 4 * pixel_block_index + pixel_index; // Little endian
-							concurrency::atomic_fetch_add(&tile_histogram[bin], weight_view[sample_index]);
+						int const bin = get_npd(pixel_n, pixel_m);
 
-							pixels_n >>= 8;
-							pixels_m >>= 8;
-						}
+						// We are little endian, so the LSB is first in memory.
+						int const sample_index = 4 * pixel_block_index + pixel_index;
+						concurrency::atomic_fetch_add(&tile_histogram[bin], weight_view[sample_index]);
 					}
-					begin_index += TILE_SIZE;
 				}
 			}
 
+			// Update global memory with this tiles histogram.
 			index.barrier.wait_with_tile_static_memory_fence();
-			if (feature_index < feature_dim) {
-				histograms_view[feature_index][index.global[0]] = tile_histogram[index.global[0]];
-			}
+			histograms_view[feature_index][index.global[0]] = tile_histogram[index.global[0]];
 		});
-	}
+	} // for feature_block_index
+
+	// Convert the histograms to floats. This will unfortunately zero-fill
+	// the histograms. That seems hard to avoid, but we make sure to do the
+	// work before waiting for syncronization.
+	std::vector<std::array<float, 256>> histograms_out(feature_dim);
 	histograms_view.synchronize();
 
-	std::vector<std::array<float, 256>> histograms_out(feature_dim);
 	for (int i = 0; i < feature_dim; ++i) {
-		int sum = 0;
 		for (int j = 0; j < 256; ++j) {
 			histograms_out[i][j] = static_cast<float>(histograms[i * 256 + j]) / static_cast<float>(scale);
-			sum += histograms[i * 256 + j];
 		}
 	}
 
@@ -396,8 +416,7 @@ Split compute_best_split(histograms_type const & histograms) {
 				w_sums[side] = weight_sums[side][POSITIVE] + weight_sums[side][NEGATIVE];
 			}
 
-			bool const all_weights_positive =
-				std::all_of(w_sums.begin(), w_sums.end(), [](double const& x) { return (x > 0.0); });
+			bool const all_weights_positive = (w_sums[LEFT] > 0.0 && w_sums[RIGHT] > 0.0);
 
 			if (all_weights_positive) {
 				double const score = pow2(wy_sums[LEFT]) / w_sums[LEFT] + pow2(wy_sums[RIGHT]) / w_sums[RIGHT];
@@ -417,21 +436,28 @@ Split compute_best_split(histograms_type const & histograms) {
 	return Split(linear_to_pair(best_feature_index), best_threshold);
 }
 
+auto get_partitioned_ranges(SampleRange * sample_range) {
+	auto range_midpoint = sort_positives_first_and_get_midpoint(sample_range);
+	std::array<SampleRange, N_LABELS> partition;
+	partition[POSITIVE] = SampleRange(sample_range->begin(), range_midpoint);
+	partition[NEGATIVE] = SampleRange(range_midpoint, sample_range->end());
+	return partition;
+}
+
 Split fit_stump(SampleRange * sample_range) {
-	auto const range_midpoint = sort_positives_first_and_get_midpoint(sample_range);
-	auto positive_range = SampleRange(sample_range->begin(), range_midpoint);
-	auto negative_range = SampleRange(range_midpoint, sample_range->end());
-	if (positive_range.empty() || negative_range.empty()) {
+	auto partitioned_ranges = get_partitioned_ranges(sample_range);
+	if (partitioned_ranges[POSITIVE].empty() ||
+		partitioned_ranges[NEGATIVE].empty()) {
 		std::cout << "Warning: Node is pure, can not split.\n";
 		return Split::Dummy();
 	}
 	histograms_type histograms;
-	histograms[POSITIVE] = accumulate_histograms_cpu(&positive_range);
-	histograms[NEGATIVE] = accumulate_histograms_cpu(&negative_range);
+	histograms[POSITIVE] = accumulate_histograms_gpu(&partitioned_ranges[POSITIVE]);
+	histograms[NEGATIVE] = accumulate_histograms_gpu(&partitioned_ranges[NEGATIVE]);
 	return compute_best_split(histograms);
 }
 
-SampleRange::iterator sort_goes_left_first_and_get_midpoint(SampleRange * range, Split const& split) {
+SampleRange::iterator sort_goes_left_first_and_get_midpoint(SampleRange * range, Split const & split) {
 	return std::partition(range->begin(), range->end(),
 		[split](Sample & sample) { return split.goes_left(sample.get_pixels()); });
 }
@@ -492,7 +518,7 @@ double get_weighted_mean(SampleRange const & range) {
 	double wy_sum = 0.0;
 	for (auto it = range.begin(); it != range.end(); ++it) {
 		w_sum += it->get_weight();
-		wy_sum += (2 * it->get_label() - 1) * it->get_weight();
+		wy_sum += it->get_weight() * it->get_signed_label();
 	}
 	if (w_sum > 0.0) {
 		return wy_sum / w_sum;
@@ -501,7 +527,6 @@ double get_weighted_mean(SampleRange const & range) {
 }
 
 DenseTree fit_tree(SampleRange * range, int depth, int min_leaf_occupancy) {
-	assert(depth > 0);
 	assert(min_leaf_occupancy >= 0);
 
 	std::deque<SampleRange> range_stack;
@@ -529,10 +554,199 @@ DenseTree fit_tree(SampleRange * range, int depth, int min_leaf_occupancy) {
 			tree.push_back_leaf(weighted_mean);
 		}
 		else {
+			std::cout << "Warning: Terminal node is starved of samples.\n";
 			tree.push_back_leaf(0.0);
 		}
 	}
 	assert(tree.is_complete());
 
 	return tree;
+}
+
+template <typename T>
+T const & clamp(T const & value, T const & min, T const & max) {
+	return std::min(std::max(value, min), max);
+}
+
+void normalize_weights_for_single_label(SampleRange * sample_range) {
+	if (sample_range->empty()) {
+		return;
+	}
+
+	double weight_sum = 0.0;
+	int active_label = sample_range->begin()->get_label();
+	for (auto const & sample : *sample_range) {
+		assert(sample.get_label() == active_label);
+		weight_sum += sample.get_weight();
+	}
+
+	if (weight_sum > 0.0) {
+		double const scale = 1.0 / weight_sum;
+		for (auto & sample : *sample_range) {
+			sample.set_weight(scale * sample.get_weight());
+		}
+	}
+	else {
+		for (auto & sample : *sample_range) {
+			double const weight = 1.0 / sample_range->size();
+			sample.set_weight(weight);
+		}
+	}
+}
+
+void normalize_weights(SampleRange * sample_range) {
+	auto partitioned_ranges = get_partitioned_ranges(sample_range);
+	for (auto label_range : partitioned_ranges) {
+		normalize_weights_for_single_label(&label_range);
+	}
+}
+
+void initialize_predictions(SampleRange * sample_range) {
+	for (auto & sample : *sample_range) {
+		sample.set_prediction(0.0);
+	}
+}
+
+void update_predictions(SampleRange * sample_range, DenseTree const & tree) {
+	for (auto & sample : *sample_range) {
+		sample.set_prediction(sample.get_prediction() + tree.predict(sample.get_pixels()));
+	}
+}
+
+void set_weights_from_predictions(SampleRange * sample_range, double max_weight) {
+	for (auto & sample : *sample_range) {
+		double const weight = std::exp(-sample.get_signed_label() * sample.get_prediction());
+		double const clamped_weight = std::min(weight, max_weight);
+		sample.set_weight(clamped_weight);
+	}
+	normalize_weights(sample_range);
+}
+
+SampleRange get_trimmed_range(SampleRange * sample_range, double trim_fraction) {
+	assert(0 <= trim_fraction && trim_fraction < 1.0);
+
+	sort_highest_weight_first(sample_range);
+
+	std::vector<double> cumsum;
+	cumsum.reserve(1 + sample_range->size());
+	cumsum.push_back(0.0);
+	for (auto const & sample : *sample_range) {
+		cumsum.push_back(cumsum.back() + sample.get_weight());
+	}
+
+	double const subset_weight = (1.0 - trim_fraction) * cumsum.back();
+	int trimmed_size = sample_range->size();
+	for (int size = 1; size < sample_range->size(); ++size) {
+		if (cumsum[size] > subset_weight) {
+			trimmed_size = size;
+			break;
+		}
+	}
+
+	return SampleRange(sample_range->begin(), sample_range->begin() + trimmed_size);
+}
+
+auto get_trimmed_ranges(SampleRange * sample_range, double trim_fraction) {
+	auto partitioned_ranges = get_partitioned_ranges(sample_range);
+	decltype(partitioned_ranges) trimmed_ranges;
+	trimmed_ranges[POSITIVE] = get_trimmed_range(&partitioned_ranges[POSITIVE], trim_fraction);
+	trimmed_ranges[NEGATIVE] = get_trimmed_range(&partitioned_ranges[NEGATIVE], trim_fraction);
+	return trimmed_ranges;
+}
+
+SampleRange move_sub_ranges_to_front(SampleRange * full_range, std::array<SampleRange, N_LABELS> * sub_ranges) {
+	decltype(*sub_ranges) sorted_sub_ranges = *sub_ranges;
+	std::sort(sorted_sub_ranges.begin(), sorted_sub_ranges.end(),
+		[](SampleRange const & lhs, SampleRange const & rhs) {
+		return (lhs.begin() < rhs.begin());
+	});
+	auto target_begin = full_range->begin();
+	for (int sub_idx = 0; sub_idx < N_LABELS; ++sub_idx) {
+		auto current_sub_range = sorted_sub_ranges[sub_idx];
+		for (int i = 0; i < current_sub_range.size(); ++i) {
+			std::swap(target_begin[i], current_sub_range[i]);
+		}
+		target_begin += current_sub_range.size();
+	}
+	return SampleRange(full_range->begin(), target_begin);
+}
+
+double compute_loss(SampleRange const & sample_range) {
+	std::array<double, N_LABELS> sums = { 0.0 };
+	std::array<int, N_LABELS> counts = { 0 };
+	for (auto const & sample : sample_range) {
+		int const label = sample.get_label();
+		sums[label] += std::exp(-sample.get_signed_label() * sample.get_prediction());
+		counts[label] += 1;
+	}
+
+	if (counts[POSITIVE] == 0 || counts[NEGATIVE] == 0) {
+		assert(false);
+		return 1.0;
+	}
+
+	double loss = 0.0;
+	for (int label = 0; label < N_LABELS; ++label) {
+		loss += sums[label] / counts[label];
+	}
+	return loss / N_LABELS;
+}
+
+int get_label_from_prediction(double prediction) {
+	return (prediction > 0.0 ? POSITIVE : NEGATIVE);
+}
+
+auto compute_error_rates(SampleRange const & sample_range) {
+	std::array<int, N_LABELS> counts = { 0 };
+	std::array<int, N_LABELS> error_counts = { 0 };
+	for (auto const & sample : sample_range) {
+		int const actual_label = sample.get_label();
+		int const predicted_label = get_label_from_prediction(sample.get_prediction());
+		counts[actual_label] += 1;
+		if (predicted_label != actual_label) {
+			error_counts[actual_label] += 1;
+		}
+	}
+	std::array<double, N_LABELS> error_rates;
+	for (int label = 0; label < N_LABELS; ++label) {
+		error_rates[label] =
+			(counts[label] > 0 ? static_cast<double>(error_counts[label]) / counts[label] : 1.0);
+	}
+	return error_rates;
+}
+
+auto learn_gab(SampleRange * sample_range) {
+	static int const tree_depth = 2;
+	static int const min_leaf_occupancy = 0;
+	static double const max_weight = 100;
+	static int const min_sample_count = 100;
+	static double const trim_fraction = 0.05;
+
+	initialize_predictions(sample_range);
+	set_weights_from_predictions(sample_range, max_weight);
+	double previousLoss = compute_loss(*sample_range);
+
+	std::vector<DenseTree> trees;
+	for (int iteration = 0; iteration < 5; ++iteration) {
+		//std::cout << "tpr = " << (1.0 - compute_error_rates(*sample_range)[POSITIVE]) << "\n";
+		//std::cout << "fpr = " << compute_error_rates(*sample_range)[NEGATIVE] << "\n";
+		auto trimmed_ranges = get_trimmed_ranges(sample_range, trim_fraction);
+		int const lowest_sample_count = std::min(trimmed_ranges[POSITIVE].size(), trimmed_ranges[NEGATIVE].size());
+		if (lowest_sample_count < min_sample_count) {
+			std::cout << "Warning: Insufficent samples to continue GAB learning.\n";
+			break;
+		}
+
+		auto active_range = move_sub_ranges_to_front(sample_range, &trimmed_ranges);
+		DenseTree const tree = fit_tree(&active_range, tree_depth, min_leaf_occupancy);
+		update_predictions(sample_range, tree);
+		set_weights_from_predictions(sample_range, max_weight);
+		trees.push_back(tree);
+
+		double const currentLoss = compute_loss(*sample_range);
+		double const relativeLossDecrease = (previousLoss - currentLoss) / previousLoss;
+		previousLoss = currentLoss;
+		std::cout << "loss decrease = " << 100.0 * relativeLossDecrease << " %\n";
+	}
+	return trees;
 }
