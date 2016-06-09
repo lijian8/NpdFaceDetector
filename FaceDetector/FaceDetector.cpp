@@ -85,7 +85,7 @@ TEST(training, sort_lowest_weight_first) {
 	std::vector<Sample> samples = {
 		Sample(NEGATIVE, { }, 2.0),
 		Sample(NEGATIVE, { }, 1.0) };
-	sort_lowest_weight_first(&SampleRange(samples));
+	sort_lowest_weight_first(SampleRange(samples));
 	EXPECT_LT(samples[0].get_weight(), samples[1].get_weight());
 }
 
@@ -93,7 +93,7 @@ TEST(training, sort_highest_weight_first) {
 	std::vector<Sample> samples = {
 		Sample(NEGATIVE, { }, 2.0),
 		Sample(NEGATIVE, { }, 1.0) };
-	sort_highest_weight_first(&SampleRange(samples));
+	sort_highest_weight_first(SampleRange(samples));
 	EXPECT_GT(samples[0].get_weight(), samples[1].get_weight());
 }
 
@@ -102,7 +102,7 @@ TEST(training, sort_positives_first_and_get_midpoint) {
 		Sample(NEGATIVE, { }),
 		Sample(NEGATIVE, { }),
 		Sample(POSITIVE, { }) };
-	auto midpoint = sort_positives_first_and_get_midpoint(&SampleRange(samples));
+	auto midpoint = sort_positives_first_and_get_midpoint(SampleRange(samples));
 	EXPECT_EQ(POSITIVE, samples[0].get_label());
 	EXPECT_EQ(NEGATIVE, samples[1].get_label());
 	EXPECT_EQ(&samples[1], midpoint);
@@ -122,7 +122,7 @@ TEST(training, accumulate_histograms) {
 		Sample(POSITIVE, { 2, 2, 0 }, 1.0),
 		Sample(POSITIVE, { 2, 2, 255 }, 3.0) };
 
-	auto histograms = accumulate_histograms_cpu(&SampleRange(samples));
+	auto histograms = accumulate_histograms_cpu(SampleRange(samples));
 
 	EXPECT_DOUBLE_EQ(1.0, histograms[pair_to_linear({ 1, 2 })][g_npd_table[2][0]]);
 	EXPECT_DOUBLE_EQ(4.0, histograms[pair_to_linear({ 0, 1 })][g_npd_table[2][2]]);
@@ -218,10 +218,10 @@ TEST(training, get_label_ranges) {
 	std::generate_n(std::back_inserter(samples), 100, [&]() {
 		counter += 1;
 		int label = counter % N_LABELS;
-		return Sample(label, { });
+		return Sample(label, {});
 	});
 
-	auto partitioned_ranges = get_label_ranges(&SampleRange(samples));
+	auto partitioned_ranges = get_label_ranges(SampleRange(samples));
 
 	for (int label = 0; label < N_LABELS; ++label) {
 		for (auto const & sample : partitioned_ranges[label]) {
@@ -239,7 +239,7 @@ TEST(training, fit_tree) {
 		Sample(NEGATIVE, { 2, 1, 0 }),
 		Sample(POSITIVE, { 2, 0, 1 }) };
 
-	auto const tree = fit_tree(&SampleRange(samples), 2, 0);
+	auto const tree = fit_tree(SampleRange(samples), 2, 0);
 
 	ASSERT_TRUE(tree.is_complete());
 	EXPECT_EQ(2, tree.get_depth());
@@ -267,22 +267,22 @@ TEST(training, clamp) {
 TEST(training, normalize_weights_for_single_label) {
 	// Empty.
 	std::vector<Sample> samples;
-	normalize_weights_for_single_label(&SampleRange(samples));
+	normalize_weights_for_single_label(SampleRange(samples));
 
 	// All zero.
 	std::generate_n(std::back_inserter(samples), 10, []() {
-		return Sample(POSITIVE, { }, 0.0);
+		return Sample(POSITIVE, {}, 0.0);
 	});
-	normalize_weights_for_single_label(&SampleRange(samples));
+	normalize_weights_for_single_label(SampleRange(samples));
 	for (auto const & sample : samples) {
 		ASSERT_DOUBLE_EQ(1.0 / 10.0, sample.get_weight());
 	}
 
 	// Some non-zero.
 	std::generate_n(std::back_inserter(samples), 10, []() {
-		return Sample(POSITIVE, { }, 5.0);
+		return Sample(POSITIVE, {}, 5.0);
 	});
-	normalize_weights_for_single_label(&SampleRange(samples));
+	normalize_weights_for_single_label(SampleRange(samples));
 	double sum = 0.0;
 	for (auto const & sample : samples) {
 		sum += sample.get_weight();
@@ -299,7 +299,7 @@ TEST(training, get_trimmed_range) {
 		Sample(NEGATIVE, { }, 5.0) };
 
 	double trim_fraction = 6.5 / 15.0;
-	auto trimmed_range = get_trimmed_range(&SampleRange(samples), trim_fraction);
+	auto trimmed_range = get_trimmed_range(SampleRange(samples), trim_fraction);
 	ASSERT_EQ(2, trimmed_range.size());
 	EXPECT_EQ(5.0, trimmed_range[0].get_weight());
 	EXPECT_EQ(4.0, trimmed_range[1].get_weight());
@@ -318,7 +318,7 @@ TEST(training, move_sub_ranges_to_front) {
 		SampleRange(&samples[3], &samples[4] + 1),
 		SampleRange(&samples[1], &samples[1] + 1) };
 
-	auto compacted_range = move_sub_ranges_to_front(&full_range, &sub_ranges);
+	auto compacted_range = move_sub_ranges_to_front(full_range, sub_ranges);
 	ASSERT_EQ(3, compacted_range.size());
 	EXPECT_EQ(2.0, compacted_range[0].get_weight());
 	EXPECT_EQ(4.0, compacted_range[1].get_weight());
@@ -352,8 +352,8 @@ private:
 TEST(training, accumulate_histograms_comparison) {
 	RandomSampleGenerator data(101, 400);
 
-	auto res_gpu = accumulate_histograms_gpu(&data.get_samples());
-	auto res_cpu = accumulate_histograms_cpu(&data.get_samples());
+	auto res_gpu = accumulate_histograms_gpu(data.get_samples());
+	auto res_cpu = accumulate_histograms_cpu(data.get_samples());
 
 	for (int i = 0; i < static_cast<int>(res_cpu.size()); ++i) {
 		for (int j = 0; j < 256; j++) {
@@ -366,11 +366,11 @@ TEST(training, accumulate_histograms_comparison) {
 // Benchmarking.
 RandomSampleGenerator g_data(101, 400);
 TEST(training, accumulate_histograms_cpu) {
-	auto res = accumulate_histograms_cpu(&g_data.get_samples());
+	auto res = accumulate_histograms_cpu(g_data.get_samples());
 	ASSERT_FALSE(res.empty());
 }
 TEST(training, accumulate_histograms_gpu) {
-	auto res = accumulate_histograms_gpu(&g_data.get_samples());
+	auto res = accumulate_histograms_gpu(g_data.get_samples());
 	ASSERT_FALSE(res.empty());
 }
 
@@ -379,9 +379,9 @@ static double const PI = 3.1415;
 class WaveSampleGenerator {
 public:
 	WaveSampleGenerator(int sample_count, int pixel_count) {
-		double const sin_magnitude = 256 / 24;
+		double const sin_magnitude = 256 / 8;
 		double const sin_period = 25;
-		int const noise_magnitude = 256 / 2;
+		int const noise_magnitude = 256 / 4;
 		int const noise_mean = 256 / 2;
 		std::default_random_engine generator(42);
 		std::uniform_int_distribution<int> noise_distribution(
@@ -424,7 +424,7 @@ private:
 
 TEST(learning, learn_gab) {
 	auto data = WaveSampleGenerator(100000, 400);
-	auto const trees = learn_gab(&data.get_training_samples());
+	auto const trees = learn_gab(data.get_training_samples());
 	std::cout << "Training complete\n";
 
 	auto test_samples = data.get_test_samples();
@@ -435,7 +435,7 @@ TEST(learning, learn_gab) {
 		}
 		sample.set_prediction(prediction);
 	}
-	double const equal_error_rate = compute_roc_auc(&test_samples);
+	double const equal_error_rate = compute_roc_auc(test_samples);
 	std::cout << "roc auc = " << equal_error_rate << "\n";
 }
 

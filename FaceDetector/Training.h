@@ -140,7 +140,6 @@ public:
 
 	static Split Dummy() {
 		// Make sure that everything goes left.
-		assert(::goes_left(254, 255));
 		assert(::goes_left(255, 255));
 		return Split({ 0, 1 }, 255);
 	}
@@ -149,10 +148,6 @@ private:
 	std::pair<int, int> _pixel_indices;
 	unsigned char _threshold;
 };
-
-double pow2(double x) {
-	return x * x;
-}
 
 class SampleRange {
 public:
@@ -194,32 +189,32 @@ private:
 	Sample * _end;
 };
 
-void sort_lowest_weight_first(SampleRange * sample_range) {
-	std::sort(sample_range->begin(), sample_range->end(),
+void sort_lowest_weight_first(SampleRange sample_range) {
+	std::sort(sample_range.begin(), sample_range.end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_weight() < rhs.get_weight());
 	});
 }
 
-void sort_highest_weight_first(SampleRange * sample_range) {
-	std::sort(sample_range->begin(), sample_range->end(),
+void sort_highest_weight_first(SampleRange sample_range) {
+	std::sort(sample_range.begin(), sample_range.end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_weight() > rhs.get_weight());
 	});
 }
 
-void sort_lowest_prediction_first(SampleRange * sample_range) {
-	std::sort(sample_range->begin(), sample_range->end(),
+void sort_lowest_prediction_first(SampleRange sample_range) {
+	std::sort(sample_range.begin(), sample_range.end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_prediction() < rhs.get_prediction());
 	});
 }
 
 // For each feature, make a histogram based on the sample weights.
-auto accumulate_histograms_cpu(SampleRange * sample_range) {
+auto accumulate_histograms_cpu(SampleRange sample_range) {
 
-	assert(!sample_range->empty());
-	int const pixel_count = sample_range->begin()->get_pixels().size();
+	assert(!sample_range.empty());
+	int const pixel_count = sample_range.begin()->get_pixels().size();
 	int const feature_dim = get_feature_dim(pixel_count);
 	std::vector<std::array<float, 256>> histograms(feature_dim);
 	for (auto & h : histograms) {
@@ -229,7 +224,7 @@ auto accumulate_histograms_cpu(SampleRange * sample_range) {
 	// So that add floats of approx. equal size.
 	sort_lowest_weight_first(sample_range);
 
-	for (auto sample = sample_range->begin(); sample < sample_range->end(); ++sample) {
+	for (auto sample = sample_range.begin(); sample < sample_range.end(); ++sample) {
 		auto const weight = static_cast<float>(sample->get_weight());
 		auto const & pixels = sample->get_pixels();
 		concurrency::parallel_for(1, pixel_count, [&](int m) {
@@ -245,16 +240,16 @@ auto accumulate_histograms_cpu(SampleRange * sample_range) {
 	return histograms;
 }
 
-auto accumulate_histograms_gpu(SampleRange * sample_range) {
-	assert(!sample_range->empty());
-	int const sample_count = sample_range->size();
-	int const pixel_count = sample_range->begin()->get_pixels().size();
+auto accumulate_histograms_gpu(SampleRange sample_range) {
+	assert(!sample_range.empty());
+	int const sample_count = sample_range.size();
+	int const pixel_count = sample_range.begin()->get_pixels().size();
 	int const feature_dim = get_feature_dim(pixel_count);
 
 	// The gpu can only accumulate uints, so we need to convert the weights.
 	// We pick a scaling so that we approximatly hit uint max if all samples fall in the same bin.
 	double weight_sum = 0.0;
-	for (auto const & sample : *sample_range) { weight_sum += sample.get_weight(); }
+	for (auto const & sample : sample_range) { weight_sum += sample.get_weight(); }
 	double const scale = 0.99 * (std::numeric_limits<unsigned int>::max() / weight_sum);
 
 	// The gpu does not support chars, so we pack four pixels into a
@@ -262,7 +257,7 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 	int const extended_sample_count = 4 * ((sample_count + 3) / 4);
 	std::vector<unsigned char> pixel_stage(extended_sample_count * pixel_count);
 	std::vector<unsigned int> weight_stage(extended_sample_count);
-	auto samples = sample_range->begin();
+	auto samples = sample_range.begin();
 	for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
 		weight_stage[sample_index] = static_cast<unsigned int>(std::round(scale * samples[sample_index].get_weight()));
 		for (int pixel_index = 0; pixel_index < pixel_count; ++pixel_index) {
@@ -417,7 +412,7 @@ Split compute_best_split(histograms_type const & histograms) {
 			bool const all_weights_positive = (w_sums[LEFT] > 0.0 && w_sums[RIGHT] > 0.0);
 
 			if (all_weights_positive) {
-				double const score = pow2(wy_sums[LEFT]) / w_sums[LEFT] + pow2(wy_sums[RIGHT]) / w_sums[RIGHT];
+				double const score = std::pow(wy_sums[LEFT], 2.0) / w_sums[LEFT] + std::pow(wy_sums[RIGHT], 2.0) / w_sums[RIGHT];
 				if (score > best_score) {
 					best_feature_index = feature_index;
 					best_threshold = threshold;
@@ -435,22 +430,22 @@ Split compute_best_split(histograms_type const & histograms) {
 	return Split(linear_to_pair(best_feature_index), best_threshold);
 }
 
-auto sort_positives_first_and_get_midpoint(SampleRange * sample_range) {
-	return std::partition(sample_range->begin(), sample_range->end(),
+auto sort_positives_first_and_get_midpoint(SampleRange sample_range) {
+	return std::partition(sample_range.begin(), sample_range.end(),
 		[](Sample const & sample) {
 		return (sample.get_label() == POSITIVE);
 	});
 }
 
-auto get_label_ranges(SampleRange * sample_range) {
+auto get_label_ranges(SampleRange sample_range) {
 	auto range_midpoint = sort_positives_first_and_get_midpoint(sample_range);
 	std::array<SampleRange, N_LABELS> label_ranges;
-	label_ranges[POSITIVE] = SampleRange(sample_range->begin(), range_midpoint);
-	label_ranges[NEGATIVE] = SampleRange(range_midpoint, sample_range->end());
+	label_ranges[POSITIVE] = SampleRange(sample_range.begin(), range_midpoint);
+	label_ranges[NEGATIVE] = SampleRange(range_midpoint, sample_range.end());
 	return label_ranges;
 }
 
-Split fit_stump(SampleRange * sample_range) {
+Split fit_stump(SampleRange sample_range) {
 	auto label_ranges = get_label_ranges(sample_range);
 	if (label_ranges[POSITIVE].empty() ||
 		label_ranges[NEGATIVE].empty()) {
@@ -458,13 +453,13 @@ Split fit_stump(SampleRange * sample_range) {
 		return Split::Dummy();
 	}
 	histograms_type histograms;
-	histograms[POSITIVE] = accumulate_histograms_gpu(&label_ranges[POSITIVE]);
-	histograms[NEGATIVE] = accumulate_histograms_gpu(&label_ranges[NEGATIVE]);
+	histograms[POSITIVE] = accumulate_histograms_gpu(label_ranges[POSITIVE]);
+	histograms[NEGATIVE] = accumulate_histograms_gpu(label_ranges[NEGATIVE]);
 	return compute_best_split(histograms);
 }
 
-SampleRange::iterator sort_goes_left_first_and_get_midpoint(SampleRange * range, Split const & split) {
-	return std::partition(range->begin(), range->end(),
+SampleRange::iterator sort_goes_left_first_and_get_midpoint(SampleRange sample_range, Split const & split) {
+	return std::partition(sample_range.begin(), sample_range.end(),
 		[split](Sample & sample) { return split.goes_left(sample.get_pixels()); });
 }
 
@@ -519,7 +514,7 @@ private:
 	}
 };
 
-double get_weighted_mean(SampleRange const & range) {
+double get_weighted_mean(SampleRange const range) {
 	double w_sum = 0.0;
 	double wy_sum = 0.0;
 	for (auto it = range.begin(); it != range.end(); ++it) {
@@ -532,11 +527,11 @@ double get_weighted_mean(SampleRange const & range) {
 	return 0.0;
 }
 
-DenseTree fit_tree(SampleRange * range, int depth, int min_leaf_occupancy) {
+DenseTree fit_tree(SampleRange range, int depth, int min_leaf_occupancy) {
 	assert(min_leaf_occupancy >= 0);
 
 	std::deque<SampleRange> range_stack;
-	range_stack.push_back(*range);
+	range_stack.push_back(range);
 	size_t const leaf_count = get_leaf_count(depth);
 
 	// Walk the tree in breadth-first order.
@@ -544,9 +539,9 @@ DenseTree fit_tree(SampleRange * range, int depth, int min_leaf_occupancy) {
 	while (range_stack.size() < leaf_count) {
 		auto range = range_stack.front();
 		range_stack.pop_front();
-		Split split = fit_stump(&range);
+		Split split = fit_stump(range);
 		tree.push_back_split(split);
-		auto range_midpoint = sort_goes_left_first_and_get_midpoint(&range, split);
+		auto range_midpoint = sort_goes_left_first_and_get_midpoint(range, split);
 		range_stack.push_back(SampleRange(range.begin(), range_midpoint));
 		range_stack.push_back(SampleRange(range_midpoint, range.end()));
 	}
@@ -574,7 +569,7 @@ T const & clamp(T const & value, T const & min, T const & max) {
 	return std::min(std::max(value, min), max);
 }
 
-bool all_is_same_label(SampleRange const & sample_range) {
+bool all_is_same_label(SampleRange const sample_range) {
 	if (sample_range.empty()) {
 		return true;
 	}
@@ -587,49 +582,49 @@ bool all_is_same_label(SampleRange const & sample_range) {
 	return true;
 }
 
-void normalize_weights_for_single_label(SampleRange * sample_range) {
-	assert(all_is_same_label(*sample_range));
-	
+void normalize_weights_for_single_label(SampleRange sample_range) {
+	assert(all_is_same_label(sample_range));
+
 	double weight_sum = 0.0;
-	for (auto const & sample : *sample_range) {
+	for (auto const & sample : sample_range) {
 		weight_sum += sample.get_weight();
 	}
 
 	if (weight_sum > 0.0) {
 		double const scale = 1.0 / weight_sum;
-		for (auto & sample : *sample_range) {
+		for (auto & sample : sample_range) {
 			sample.set_weight(scale * sample.get_weight());
 		}
 	}
 	else {
-		for (auto & sample : *sample_range) {
-			double const weight = 1.0 / sample_range->size();
+		for (auto & sample : sample_range) {
+			double const weight = 1.0 / sample_range.size();
 			sample.set_weight(weight);
 		}
 	}
 }
 
-void normalize_weights(SampleRange * sample_range) {
+void normalize_weights(SampleRange sample_range) {
 	auto label_ranges = get_label_ranges(sample_range);
 	for (auto label_range : label_ranges) {
-		normalize_weights_for_single_label(&label_range);
+		normalize_weights_for_single_label(label_range);
 	}
 }
 
-void initialize_predictions(SampleRange * sample_range) {
-	for (auto & sample : *sample_range) {
+void initialize_predictions(SampleRange sample_range) {
+	for (auto & sample : sample_range) {
 		sample.set_prediction(0.0);
 	}
 }
 
-void update_predictions(SampleRange * sample_range, DenseTree const & tree) {
-	for (auto & sample : *sample_range) {
+void update_predictions(SampleRange sample_range, DenseTree const & tree) {
+	for (auto & sample : sample_range) {
 		sample.set_prediction(sample.get_prediction() + tree.predict(sample.get_pixels()));
 	}
 }
 
-void set_weights_from_predictions(SampleRange * sample_range, double max_weight) {
-	for (auto & sample : *sample_range) {
+void set_weights_from_predictions(SampleRange sample_range, double max_weight) {
+	for (auto & sample : sample_range) {
 		double const weight = std::exp(-sample.get_signed_label() * sample.get_prediction());
 		double const clamped_weight = std::min(weight, max_weight);
 		sample.set_weight(clamped_weight);
@@ -637,58 +632,58 @@ void set_weights_from_predictions(SampleRange * sample_range, double max_weight)
 	normalize_weights(sample_range);
 }
 
-SampleRange get_trimmed_range(SampleRange * sample_range, double trim_fraction) {
+SampleRange get_trimmed_range(SampleRange sample_range, double trim_fraction) {
 	assert(0 <= trim_fraction && trim_fraction < 1.0);
 
 	sort_highest_weight_first(sample_range);
 
 	std::vector<double> cumsum;
-	cumsum.reserve(1 + sample_range->size());
+	cumsum.reserve(1 + sample_range.size());
 	cumsum.push_back(0.0);
-	for (auto const & sample : *sample_range) {
+	for (auto const & sample : sample_range) {
 		cumsum.push_back(cumsum.back() + sample.get_weight());
 	}
 
 	double const subset_weight = (1.0 - trim_fraction) * cumsum.back();
-	int trimmed_size = sample_range->size();
-	for (int size = 1; size < sample_range->size(); ++size) {
+	int trimmed_size = sample_range.size();
+	for (int size = 1; size < sample_range.size(); ++size) {
 		if (cumsum[size] > subset_weight) {
 			trimmed_size = size;
 			break;
 		}
 	}
 
-	// std::cout << "Info: Trimmed size = " << static_cast<double>(trimmed_size) / sample_range->size() << "\n";
+	// std::cout << "Info: Trimmed size = " << static_cast<double>(trimmed_size) / sample_range.size() << "\n";
 
-	return SampleRange(sample_range->begin(), sample_range->begin() + trimmed_size);
+	return SampleRange(sample_range.begin(), sample_range.begin() + trimmed_size);
 }
 
-auto get_trimmed_ranges(SampleRange * sample_range, double trim_fraction) {
+auto get_trimmed_ranges(SampleRange sample_range, double trim_fraction) {
 	auto label_ranges = get_label_ranges(sample_range);
 	decltype(label_ranges) trimmed_ranges;
-	trimmed_ranges[POSITIVE] = get_trimmed_range(&label_ranges[POSITIVE], trim_fraction);
-	trimmed_ranges[NEGATIVE] = get_trimmed_range(&label_ranges[NEGATIVE], trim_fraction);
+	trimmed_ranges[POSITIVE] = get_trimmed_range(label_ranges[POSITIVE], trim_fraction);
+	trimmed_ranges[NEGATIVE] = get_trimmed_range(label_ranges[NEGATIVE], trim_fraction);
 	return trimmed_ranges;
 }
 
-SampleRange move_sub_ranges_to_front(SampleRange * full_range, std::array<SampleRange, N_LABELS> * sub_ranges) {
-	decltype(*sub_ranges) sorted_sub_ranges = *sub_ranges;
-	std::sort(sorted_sub_ranges.begin(), sorted_sub_ranges.end(),
-		[](SampleRange const & lhs, SampleRange const & rhs) {
+SampleRange move_sub_ranges_to_front(SampleRange full_range, std::array<SampleRange, N_LABELS> sub_ranges) {
+	std::sort(sub_ranges.begin(), sub_ranges.end(),
+		[](SampleRange const lhs, SampleRange const rhs) {
 		return (lhs.begin() < rhs.begin());
 	});
-	auto target_begin = full_range->begin();
+	assert(sub_ranges[0].end() <= sub_ranges[1].begin());
+	auto target_begin = full_range.begin();
 	for (int sub_idx = 0; sub_idx < N_LABELS; ++sub_idx) {
-		auto current_sub_range = sorted_sub_ranges[sub_idx];
+		auto current_sub_range = sub_ranges[sub_idx];
 		for (int i = 0; i < current_sub_range.size(); ++i) {
 			std::swap(target_begin[i], current_sub_range[i]);
 		}
 		target_begin += current_sub_range.size();
 	}
-	return SampleRange(full_range->begin(), target_begin);
+	return SampleRange(full_range.begin(), target_begin);
 }
 
-double compute_loss(SampleRange const & sample_range) {
+double compute_loss(SampleRange const sample_range) {
 	std::array<double, N_LABELS> sums = { 0.0 };
 	std::array<int, N_LABELS> counts = { 0 };
 	for (auto const & sample : sample_range) {
@@ -709,7 +704,7 @@ double compute_loss(SampleRange const & sample_range) {
 	return loss / N_LABELS;
 }
 
-std::array<int, N_LABELS> get_label_counts(SampleRange const & sample_range) {
+std::array<int, N_LABELS> get_label_counts(SampleRange const sample_range) {
 	std::array<int, N_LABELS> counts = { 0 };
 	for (auto const & sample : sample_range) {
 		counts[sample.get_label()] += 1;
@@ -717,14 +712,14 @@ std::array<int, N_LABELS> get_label_counts(SampleRange const & sample_range) {
 	return counts;
 }
 
-double compute_roc_auc(SampleRange * sample_range) {
-	auto const total_label_counts = get_label_counts(*sample_range);
+double compute_roc_auc(SampleRange sample_range) {
+	auto const total_label_counts = get_label_counts(sample_range);
 	assert(total_label_counts[POSITIVE] > 0 && total_label_counts[NEGATIVE] > 0);
 
 	sort_lowest_prediction_first(sample_range);
 	std::vector<double> thresholds;
-	thresholds.reserve(1 + sample_range->size());
-	for (auto const & sample : *sample_range) {
+	thresholds.reserve(sample_range.size() + 1);
+	for (auto const & sample : sample_range) {
 		thresholds.push_back(sample.get_prediction());
 	}
 	thresholds.erase(std::unique(thresholds.begin(), thresholds.end()), thresholds.end());
@@ -736,9 +731,9 @@ double compute_roc_auc(SampleRange * sample_range) {
 	int sample_idx = 0;
 	std::array<int, N_LABELS> partial_label_counts = { 0 };
 	for (auto const threshold : thresholds) {
-		while (sample_idx < sample_range->size() &&
-			(*sample_range)[sample_idx].get_prediction() < threshold) {
-			partial_label_counts[(*sample_range)[sample_idx].get_label()] += 1;
+		while (sample_idx < sample_range.size() &&
+			(sample_range)[sample_idx].get_prediction() < threshold) {
+			partial_label_counts[(sample_range)[sample_idx].get_label()] += 1;
 			sample_idx += 1;
 		}
 
@@ -761,7 +756,7 @@ double compute_roc_auc(SampleRange * sample_range) {
 	return auc;
 }
 
-auto learn_gab(SampleRange * sample_range) {
+auto learn_gab(SampleRange sample_range) {
 	static int const tree_depth = 2;
 	static int const min_leaf_occupancy = 0;
 	static double const max_weight = 100;
@@ -772,7 +767,7 @@ auto learn_gab(SampleRange * sample_range) {
 	set_weights_from_predictions(sample_range, max_weight);
 
 	std::vector<DenseTree> trees;
-	for (int iteration = 0; iteration < 1; ++iteration) {
+	for (int iteration = 0; iteration < 10; ++iteration) {
 		auto trimmed_ranges = get_trimmed_ranges(sample_range, trim_fraction);
 		int const lowest_sample_count = std::min(trimmed_ranges[POSITIVE].size(), trimmed_ranges[NEGATIVE].size());
 		if (lowest_sample_count < min_sample_count) {
@@ -780,13 +775,13 @@ auto learn_gab(SampleRange * sample_range) {
 			break;
 		}
 
-		auto active_range = move_sub_ranges_to_front(sample_range, &trimmed_ranges);
-		DenseTree const tree = fit_tree(&active_range, tree_depth, min_leaf_occupancy);
+		auto active_range = move_sub_ranges_to_front(sample_range, trimmed_ranges);
+		DenseTree const tree = fit_tree(active_range, tree_depth, min_leaf_occupancy);
 		update_predictions(sample_range, tree);
 		set_weights_from_predictions(sample_range, max_weight);
 		trees.push_back(tree);
 
-		std::cout << "Info: Loss = " << compute_loss(*sample_range) << "\n";
+		std::cout << "Info: Loss = " << compute_loss(sample_range) << "\n";
 		std::cout << "Info: ROC AUC = " << compute_roc_auc(sample_range) << "\n";
 	}
 	return trees;
