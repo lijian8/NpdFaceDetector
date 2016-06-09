@@ -89,12 +89,9 @@ int get_feature_dim(int pixel_count) {
 unsigned int get_npd(unsigned int n, unsigned int m) restrict(amp, cpu) {
 	float diff = 0.5f;
 	if (n > 0 || m > 0) {
-		// Without the 0.5, things like 256 * 33 / (33 + 33) will floor to 
-		// 128 on cpu and 127 on gpu.
-		diff = static_cast<float>(n) / (static_cast<float>(n + m) + 0.5f);
+		// Constant needed to get gpu to match cpu.
+		diff = static_cast<float>(n + 1.0e-3f) / static_cast<float>(n + m);
 	}
-	// This is correct. If you do round(255 * diff), the bins at
-	// 0 and 255 will only be 0.5 wide.
 	diff = fm::fmin(fm::floor(256.0f * diff), 255.0f);
 	return static_cast<unsigned int>(diff);
 }
@@ -142,7 +139,8 @@ public:
 	}
 
 	static Split Dummy() {
-		// Make sure that _everything_ goes left.
+		// Make sure that everything goes left.
+		assert(::goes_left(254, 255));
 		assert(::goes_left(255, 255));
 		return Split({ 0, 1 }, 255);
 	}
@@ -207,6 +205,13 @@ void sort_highest_weight_first(SampleRange * sample_range) {
 	std::sort(sample_range->begin(), sample_range->end(),
 		[](Sample const & lhs, Sample const & rhs) {
 		return (lhs.get_weight() > rhs.get_weight());
+	});
+}
+
+void sort_lowest_prediction_first(SampleRange * sample_range) {
+	std::sort(sample_range->begin(), sample_range->end(),
+		[](Sample const & lhs, Sample const & rhs) {
+		return (lhs.get_prediction() < rhs.get_prediction());
 	});
 }
 
@@ -352,13 +357,6 @@ auto accumulate_histograms_gpu(SampleRange * sample_range) {
 // Indexing is [label][feature_index][bin]
 typedef std::array<std::vector<std::array<float, 256>>, N_LABELS> histograms_type;
 
-auto sort_positives_first_and_get_midpoint(SampleRange * sample_range) {
-	return std::partition(sample_range->begin(), sample_range->end(),
-		[](Sample const & sample) {
-		return (sample.get_label() == POSITIVE);
-	});
-}
-
 // Compute the total weight per label.
 std::array<double, N_LABELS> compute_weight_totals(histograms_type const & histograms) {
 	std::array<double, N_LABELS> weight_totals;
@@ -433,27 +431,35 @@ Split compute_best_split(histograms_type const & histograms) {
 		std::cout << "Warning: No feature splits the samples.\n";
 		return Split::Dummy();
 	}
+	//std::cout << "Info: Best score = " << best_score << "\n";
 	return Split(linear_to_pair(best_feature_index), best_threshold);
 }
 
-auto get_partitioned_ranges(SampleRange * sample_range) {
+auto sort_positives_first_and_get_midpoint(SampleRange * sample_range) {
+	return std::partition(sample_range->begin(), sample_range->end(),
+		[](Sample const & sample) {
+		return (sample.get_label() == POSITIVE);
+	});
+}
+
+auto get_label_ranges(SampleRange * sample_range) {
 	auto range_midpoint = sort_positives_first_and_get_midpoint(sample_range);
-	std::array<SampleRange, N_LABELS> partition;
-	partition[POSITIVE] = SampleRange(sample_range->begin(), range_midpoint);
-	partition[NEGATIVE] = SampleRange(range_midpoint, sample_range->end());
-	return partition;
+	std::array<SampleRange, N_LABELS> label_ranges;
+	label_ranges[POSITIVE] = SampleRange(sample_range->begin(), range_midpoint);
+	label_ranges[NEGATIVE] = SampleRange(range_midpoint, sample_range->end());
+	return label_ranges;
 }
 
 Split fit_stump(SampleRange * sample_range) {
-	auto partitioned_ranges = get_partitioned_ranges(sample_range);
-	if (partitioned_ranges[POSITIVE].empty() ||
-		partitioned_ranges[NEGATIVE].empty()) {
+	auto label_ranges = get_label_ranges(sample_range);
+	if (label_ranges[POSITIVE].empty() ||
+		label_ranges[NEGATIVE].empty()) {
 		std::cout << "Warning: Node is pure, can not split.\n";
 		return Split::Dummy();
 	}
 	histograms_type histograms;
-	histograms[POSITIVE] = accumulate_histograms_gpu(&partitioned_ranges[POSITIVE]);
-	histograms[NEGATIVE] = accumulate_histograms_gpu(&partitioned_ranges[NEGATIVE]);
+	histograms[POSITIVE] = accumulate_histograms_gpu(&label_ranges[POSITIVE]);
+	histograms[NEGATIVE] = accumulate_histograms_gpu(&label_ranges[NEGATIVE]);
 	return compute_best_split(histograms);
 }
 
@@ -568,15 +574,24 @@ T const & clamp(T const & value, T const & min, T const & max) {
 	return std::min(std::max(value, min), max);
 }
 
-void normalize_weights_for_single_label(SampleRange * sample_range) {
-	if (sample_range->empty()) {
-		return;
+bool all_is_same_label(SampleRange const & sample_range) {
+	if (sample_range.empty()) {
+		return true;
 	}
+	int const label = sample_range[0].get_label();
+	for (auto const & sample : sample_range) {
+		if (sample.get_label() != label) {
+			return false;
+		}
+	}
+	return true;
+}
 
+void normalize_weights_for_single_label(SampleRange * sample_range) {
+	assert(all_is_same_label(*sample_range));
+	
 	double weight_sum = 0.0;
-	int active_label = sample_range->begin()->get_label();
 	for (auto const & sample : *sample_range) {
-		assert(sample.get_label() == active_label);
 		weight_sum += sample.get_weight();
 	}
 
@@ -595,8 +610,8 @@ void normalize_weights_for_single_label(SampleRange * sample_range) {
 }
 
 void normalize_weights(SampleRange * sample_range) {
-	auto partitioned_ranges = get_partitioned_ranges(sample_range);
-	for (auto label_range : partitioned_ranges) {
+	auto label_ranges = get_label_ranges(sample_range);
+	for (auto label_range : label_ranges) {
 		normalize_weights_for_single_label(&label_range);
 	}
 }
@@ -643,14 +658,16 @@ SampleRange get_trimmed_range(SampleRange * sample_range, double trim_fraction) 
 		}
 	}
 
+	// std::cout << "Info: Trimmed size = " << static_cast<double>(trimmed_size) / sample_range->size() << "\n";
+
 	return SampleRange(sample_range->begin(), sample_range->begin() + trimmed_size);
 }
 
 auto get_trimmed_ranges(SampleRange * sample_range, double trim_fraction) {
-	auto partitioned_ranges = get_partitioned_ranges(sample_range);
-	decltype(partitioned_ranges) trimmed_ranges;
-	trimmed_ranges[POSITIVE] = get_trimmed_range(&partitioned_ranges[POSITIVE], trim_fraction);
-	trimmed_ranges[NEGATIVE] = get_trimmed_range(&partitioned_ranges[NEGATIVE], trim_fraction);
+	auto label_ranges = get_label_ranges(sample_range);
+	decltype(label_ranges) trimmed_ranges;
+	trimmed_ranges[POSITIVE] = get_trimmed_range(&label_ranges[POSITIVE], trim_fraction);
+	trimmed_ranges[NEGATIVE] = get_trimmed_range(&label_ranges[NEGATIVE], trim_fraction);
 	return trimmed_ranges;
 }
 
@@ -692,27 +709,56 @@ double compute_loss(SampleRange const & sample_range) {
 	return loss / N_LABELS;
 }
 
-int get_label_from_prediction(double prediction) {
-	return (prediction > 0.0 ? POSITIVE : NEGATIVE);
+std::array<int, N_LABELS> get_label_counts(SampleRange const & sample_range) {
+	std::array<int, N_LABELS> counts = { 0 };
+	for (auto const & sample : sample_range) {
+		counts[sample.get_label()] += 1;
+	}
+	return counts;
 }
 
-auto compute_error_rates(SampleRange const & sample_range) {
-	std::array<int, N_LABELS> counts = { 0 };
-	std::array<int, N_LABELS> error_counts = { 0 };
-	for (auto const & sample : sample_range) {
-		int const actual_label = sample.get_label();
-		int const predicted_label = get_label_from_prediction(sample.get_prediction());
-		counts[actual_label] += 1;
-		if (predicted_label != actual_label) {
-			error_counts[actual_label] += 1;
+double compute_roc_auc(SampleRange * sample_range) {
+	auto const total_label_counts = get_label_counts(*sample_range);
+	assert(total_label_counts[POSITIVE] > 0 && total_label_counts[NEGATIVE] > 0);
+
+	sort_lowest_prediction_first(sample_range);
+	std::vector<double> thresholds;
+	thresholds.reserve(1 + sample_range->size());
+	for (auto const & sample : *sample_range) {
+		thresholds.push_back(sample.get_prediction());
+	}
+	thresholds.erase(std::unique(thresholds.begin(), thresholds.end()), thresholds.end());
+	thresholds.push_back(thresholds.back() + 1.0);
+	int const threshold_count = thresholds.size();
+
+	std::vector<double> fprs; fprs.reserve(threshold_count);
+	std::vector<double> tprs; tprs.reserve(threshold_count);
+	int sample_idx = 0;
+	std::array<int, N_LABELS> partial_label_counts = { 0 };
+	for (auto const threshold : thresholds) {
+		while (sample_idx < sample_range->size() &&
+			(*sample_range)[sample_idx].get_prediction() < threshold) {
+			partial_label_counts[(*sample_range)[sample_idx].get_label()] += 1;
+			sample_idx += 1;
 		}
+
+		double const tnr = static_cast<double>(partial_label_counts[NEGATIVE]) / total_label_counts[NEGATIVE];
+		double const fpr = 1.0 - tnr;
+		double const fnr = static_cast<double>(partial_label_counts[POSITIVE]) / total_label_counts[POSITIVE];
+		double const tpr = 1.0 - fnr;
+
+		fprs.push_back(fpr);
+		tprs.push_back(tpr);
 	}
-	std::array<double, N_LABELS> error_rates;
-	for (int label = 0; label < N_LABELS; ++label) {
-		error_rates[label] =
-			(counts[label] > 0 ? static_cast<double>(error_counts[label]) / counts[label] : 1.0);
+
+	double auc = 0.0;
+	for (int i = 1; i < threshold_count; ++i) {
+		double const dx = fprs[i - 1] - fprs[i];
+		double const height = (tprs[i - 1] + tprs[i]) / 2.0;
+		auc += height * dx;
 	}
-	return error_rates;
+
+	return auc;
 }
 
 auto learn_gab(SampleRange * sample_range) {
@@ -724,12 +770,9 @@ auto learn_gab(SampleRange * sample_range) {
 
 	initialize_predictions(sample_range);
 	set_weights_from_predictions(sample_range, max_weight);
-	double previousLoss = compute_loss(*sample_range);
 
 	std::vector<DenseTree> trees;
-	for (int iteration = 0; iteration < 5; ++iteration) {
-		//std::cout << "tpr = " << (1.0 - compute_error_rates(*sample_range)[POSITIVE]) << "\n";
-		//std::cout << "fpr = " << compute_error_rates(*sample_range)[NEGATIVE] << "\n";
+	for (int iteration = 0; iteration < 1; ++iteration) {
 		auto trimmed_ranges = get_trimmed_ranges(sample_range, trim_fraction);
 		int const lowest_sample_count = std::min(trimmed_ranges[POSITIVE].size(), trimmed_ranges[NEGATIVE].size());
 		if (lowest_sample_count < min_sample_count) {
@@ -743,10 +786,8 @@ auto learn_gab(SampleRange * sample_range) {
 		set_weights_from_predictions(sample_range, max_weight);
 		trees.push_back(tree);
 
-		double const currentLoss = compute_loss(*sample_range);
-		double const relativeLossDecrease = (previousLoss - currentLoss) / previousLoss;
-		previousLoss = currentLoss;
-		std::cout << "loss decrease = " << 100.0 * relativeLossDecrease << " %\n";
+		std::cout << "Info: Loss = " << compute_loss(*sample_range) << "\n";
+		std::cout << "Info: ROC AUC = " << compute_roc_auc(sample_range) << "\n";
 	}
 	return trees;
 }

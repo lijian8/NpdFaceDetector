@@ -69,7 +69,7 @@ TEST(training, normalized_pixel_difference_gpu) {
 	npd_table_gpu_view.synchronize();
 	for (int i = 0; i < 256; ++i) {
 		for (int j = 0; j < 256; ++j) {
-			EXPECT_EQ(npd_table_cpu[i][j], npd_table_gpu[i * 256 + j]) <<
+			ASSERT_EQ(npd_table_cpu[i][j], npd_table_gpu[i * 256 + j]) <<
 				"i = " << i << " j = " << j;
 		}
 	}
@@ -212,7 +212,7 @@ TEST(training, get_split_count) {
 	EXPECT_EQ(15, get_split_count(4));
 }
 
-TEST(training, get_partitioned_ranges) {
+TEST(training, get_label_ranges) {
 	std::vector<Sample> samples;
 	int counter = 0;
 	std::generate_n(std::back_inserter(samples), 100, [&]() {
@@ -221,7 +221,7 @@ TEST(training, get_partitioned_ranges) {
 		return Sample(label, { });
 	});
 
-	auto partitioned_ranges = get_partitioned_ranges(&SampleRange(samples));
+	auto partitioned_ranges = get_label_ranges(&SampleRange(samples));
 
 	for (int label = 0; label < N_LABELS; ++label) {
 		for (auto const & sample : partitioned_ranges[label]) {
@@ -379,9 +379,9 @@ static double const PI = 3.1415;
 class WaveSampleGenerator {
 public:
 	WaveSampleGenerator(int sample_count, int pixel_count) {
-		double const sin_magnitude = 256 / 8;
+		double const sin_magnitude = 256 / 24;
 		double const sin_period = 25;
-		int const noise_magnitude = 256 / 4;
+		int const noise_magnitude = 256 / 2;
 		int const noise_mean = 256 / 2;
 		std::default_random_engine generator(42);
 		std::uniform_int_distribution<int> noise_distribution(
@@ -392,7 +392,7 @@ public:
 		_samples.reserve(sample_count);
 		for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
 			std::vector<unsigned char> pixels(pixel_count);
-			int label = (sample_idx % 20 == 0 ? POSITIVE : NEGATIVE);
+			int label = (sample_idx % 2 == 0 ? POSITIVE : NEGATIVE);
 			if (label == POSITIVE) {
 				for (int i = 0; i < pixel_count; ++i) {
 					double const sin_phase = phase_distribution(generator);
@@ -425,6 +425,7 @@ private:
 TEST(learning, learn_gab) {
 	auto data = WaveSampleGenerator(100000, 400);
 	auto const trees = learn_gab(&data.get_training_samples());
+	std::cout << "Training complete\n";
 
 	auto test_samples = data.get_test_samples();
 	for (auto & sample : test_samples) {
@@ -434,9 +435,8 @@ TEST(learning, learn_gab) {
 		}
 		sample.set_prediction(prediction);
 	}
-	auto const error_rates = compute_error_rates(test_samples);
-	std::cout << "true positive rate = " << (1.0 - error_rates[POSITIVE]) << "\n";
-	std::cout << "false positive rate = " << error_rates[NEGATIVE] << "\n";
+	double const equal_error_rate = compute_roc_auc(&test_samples);
+	std::cout << "roc auc = " << equal_error_rate << "\n";
 }
 
 int main(int argc, char** argv) {
